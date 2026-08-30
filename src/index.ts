@@ -1,3 +1,18 @@
+/**
+ * dsh-env-switcher — 环境变量管理
+ *
+ * 功能：
+ * 1. .env解析
+ * 2. 变量设置
+ * 3. 差异对比
+ * 4. 环境切换
+ * 5. 备份恢复
+ * 6. 验证
+ *
+ * 工具：env_list, env_get, env_set, env_diff, env_switch, env_backup, env_validate
+ * 命令：/env
+ * 配置：enabled
+ */
 import { readFileSync, writeFileSync, existsSync, readdirSync, copyFileSync } from 'node:fs';
 import { resolve, join } from 'node:path';
 import { z } from 'zod';

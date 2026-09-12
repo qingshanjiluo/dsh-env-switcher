@@ -1,208 +1,565 @@
 /**
- * dsh-env-switcher — 环境变量管理
- *
- * 功能：
- * 1. .env解析
- * 2. 变量设置
- * 3. 差异对比
- * 4. 环境切换
- * 5. 备份恢复
- * 6. 验证
- *
- * 工具：env_list, env_get, env_set, env_diff, env_switch, env_backup, env_validate
- * 命令：/env
- * 配置：enabled
+ * Pure `.env` text toolkit for DeepSeek Harness. Four tools — `env_parse`,
+ * `env_diff`, `env_validate`, `env_serialize` — read and write dotenv file
+ * *content* that the caller supplies as text. The plugin never opens a file,
+ * spawns a process, or reads the host's real environment, so every call is
+ * deterministic and safe to run in parallel.
+ * @module @qingshanjiluo/dsh-env-switcher
  */
-import { readFileSync, writeFileSync, existsSync, readdirSync, copyFileSync } from 'node:fs';
-import { resolve, join } from 'node:path';
-import { z } from 'zod';
 
-export const name = 'dsh-env-switcher';
-export const inject = ['settings', 'tools', 'commands'];
+import type { Context } from '@deepseek-ai/cordis'
+import { defineTool } from '@deepseek-ai/dsh-tools'
+import z from '@deepseek-ai/schemastery'
 
-const configSchema = z.object({
-  enabled: z.boolean().default(true),
-  envFile: z.string().default('.env'),
-  backupEnabled: z.boolean().default(true),
-});
+export const name = 'dsh-env-switcher'
+export const inject = ['tools']
 
-type Config = z.infer<typeof configSchema>;
-
-function parseEnvFile(path: string): Record<string, string> {
-  if (!existsSync(path)) return {};
-  const content = readFileSync(path, 'utf-8');
-  const vars: Record<string, string> = {};
-  for (const line of content.split('\n')) {
-    const trimmed = line.trim();
-    if (!trimmed || trimmed.startsWith('#')) continue;
-    const eqIdx = trimmed.indexOf('=');
-    if (eqIdx === -1) continue;
-    const key = trimmed.substring(0, eqIdx).trim();
-    let value = trimmed.substring(eqIdx + 1).trim();
-    if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
-      value = value.slice(1, -1);
-    }
-    vars[key] = value;
-  }
-  return vars;
+/** Deployment policy shared by the env text tools. */
+export interface Config {
+  /** Accept `export KEY=value` statements while parsing. */
+  allowExportPrefix: boolean
+  /** Strip a trailing ` # comment` from unquoted values while parsing. */
+  stripInlineComments: boolean
+  /** Keys longer than this many characters are reported invalid, never stored. */
+  maxKeyLength: number
 }
 
-function writeEnvFile(path: string, vars: Record<string, string>): void {
-  const lines = Object.entries(vars).map(([k, v]) => {
-    if (v.includes(' ') || v.includes('#')) return `${k}="${v}"`;
-    return `${k}=${v}`;
-  });
-  writeFileSync(path, lines.join('\n') + '\n', 'utf-8');
+/** Schemastery configuration for the env text tools. */
+export const Config: z<Config> = z.object({
+  allowExportPrefix: z.boolean().default(true),
+  stripInlineComments: z.boolean().default(true),
+  maxKeyLength: z.number().default(128),
+})
+
+/** Parse policy resolved from {@link Config} (defensively normalised). */
+interface ParseOptions {
+  allowExportPrefix: boolean
+  stripInlineComments: boolean
+  maxKeyLength: number
 }
 
-function diffEnv(base: Record<string, string>, target: Record<string, string>) {
-  const added: Record<string, string> = {};
-  const removed: Record<string, string> = {};
-  const changed: Record<string, { from: string; to: string }> = {};
-  for (const [k, v] of Object.entries(target)) {
-    if (!(k in base)) added[k] = v;
-    else if (base[k] !== v) changed[k] = { from: base[k], to: v };
-  }
-  for (const k of Object.keys(base)) {
-    if (!(k in target)) removed[k] = base[k];
-  }
-  return { added, removed, changed };
+/** Parsed dotenv content: values in first-seen order plus skipped lines. */
+interface ParsedEnv {
+  values: Record<string, string>
+  invalid: string[]
 }
 
-function backupEnv(path: string): string {
-  const backupPath = path + '.backup.' + Date.now();
-  copyFileSync(path, backupPath);
-  return backupPath;
+/** Per-key failure kinds accepted by `env_validate`. */
+type CheckName = 'nonempty' | 'integer' | 'number' | 'boolean' | 'port' | 'url' | 'email' | 'csv' | 'pattern'
+
+const KEY_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/
+const INTEGER_PATTERN = /^[+-]?\d+$/
+const BOOLEAN_PATTERN = /^(?:true|false|1|0|yes|no|on|off)$/i
+const EMAIL_PATTERN = /^[^\s@]+@[^\s@.]+(?:\.[^\s@.]+)+$/
+const SAFE_VALUE_PATTERN = /^[A-Za-z0-9_./:+~@-]*$/
+
+/** Shorten one source line for use inside a diagnostic message. */
+function preview(text: string): string {
+  return text.length > 48 ? `${text.slice(0, 48)}...` : text
 }
 
-function validateEnvVars(vars: Record<string, string>): { key: string; issue: string }[] {
-  const issues: { key: string; issue: string }[] = [];
-  for (const [k, v] of Object.entries(vars)) {
-    if (!v) issues.push({ key: k, issue: '值为空' });
-    if (/^(password|secret|token|key)$/i.test(k) && v.length < 8) issues.push({ key: k, issue: '敏感字段值过短' });
-    if (v === 'undefined' || v === 'null') issues.push({ key: k, issue: '值为字面量 undefined/null' });
-  }
-  return issues;
+/** Assign one key without ever triggering prototype setters (`__proto__`). */
+function setKey(target: Record<string, string>, key: string, value: string): void {
+  Object.defineProperty(target, key, { value, enumerable: true, writable: true, configurable: true })
 }
 
-export function apply(ctx: any, config: Config) {
-  if (!config.enabled) return;
-
-  ctx.effect(() => ctx.tools.register({
-    name: 'env_list',
-    description: '列出 .env 文件中的所有环境变量。',
-    parameters: { file: { type: 'string', description: '.env 文件路径（默认当前配置）' } },
-    output: { schema: { type: 'json' }, render: (_a: unknown, v: unknown) => {
-      const vars = v as Record<string, string>;
-      const keys = Object.keys(vars);
-      if (keys.length === 0) return [{ type: 'text', text: '📭 没有环境变量' }];
-      return [{ type: 'text', text: `## 🔧 环境变量 (${keys.length})\n` + keys.map(k => `- \`${k}\` = \`${vars[k].substring(0, 30)}${vars[k].length > 30 ? '...' : ''}\``).join('\n') }];
-    }},
-    async execute(args: { file?: string }) { return parseEnvFile(resolve(args.file || config.envFile)); },
-  }), 'dsh-env-switcher: env_list');
-
-  ctx.effect(() => ctx.tools.register({
-    name: 'env_get',
-    description: '获取指定环境变量的值。',
-    parameters: { key: { type: 'string', description: '变量名' }, file: { type: 'string', description: '文件路径' } },
-    output: { schema: { type: 'json' }, render: (_a: unknown, v: unknown) => [{ type: 'text', text: v as string }] },
-    async execute(args: { key: string; file?: string }) {
-      const vars = parseEnvFile(resolve(args.file || config.envFile));
-      return vars[args.key] ?? `(未设置: ${args.key})`;
-    },
-  }), 'dsh-env-switcher: env_get');
-
-  ctx.effect(() => ctx.tools.register({
-    name: 'env_set',
-    description: '设置环境变量（写入 .env 文件）。',
-    parameters: { key: { type: 'string', description: '变量名' }, value: { type: 'string', description: '变量值' }, file: { type: 'string', description: '文件路径' } },
-    output: { schema: { type: 'json' }, render: (_a: unknown, v: unknown) => [{ type: 'text', text: `✅ ${v}` }] },
-    async execute(args: { key: string; value: string; file?: string }) {
-      const path = resolve(args.file || config.envFile);
-      const vars = parseEnvFile(path);
-      vars[args.key] = args.value;
-      writeEnvFile(path, vars);
-      return `已设置 ${args.key}=${args.value.substring(0, 20)}${args.value.length > 20 ? '...' : ''}`;
-    },
-  }), 'dsh-env-switcher: env_set');
-
-  ctx.effect(() => ctx.tools.register({
-    name: 'env_diff',
-    description: '比较两个 .env 文件的差异。',
-    parameters: { file1: { type: 'string', description: '第一个文件' }, file2: { type: 'string', description: '第二个文件' } },
-    output: { schema: { type: 'json' }, render: (_a: unknown, v: unknown) => {
-      const d = v as any;
-      const lines = ['## 📊 环境变量差异'];
-      if (Object.keys(d.added).length) { lines.push('### 新增'); for (const [k, v] of Object.entries(d.added)) lines.push(`+ ${k}=${v}`); }
-      if (Object.keys(d.removed).length) { lines.push('### 删除'); for (const k of Object.keys(d.removed)) lines.push(`- ${k}`); }
-      if (Object.keys(d.changed).length) { lines.push('### 修改'); for (const [k, c] of Object.entries(d.changed)) { const cv = c as any; lines.push(`~ ${k}: ${cv.from} → ${cv.to}`); } }
-      return [{ type: 'text', text: lines.join('\n') }];
-    }},
-    async execute(args: { file1: string; file2: string }) {
-      return diffEnv(parseEnvFile(resolve(args.file1)), parseEnvFile(resolve(args.file2)));
-    },
-  }), 'dsh-env-switcher: env_diff');
-
-  ctx.effect(() => ctx.tools.register({
-    name: 'env_switch',
-    description: '切换到不同的环境配置文件（如 .env.development → .env.production）。',
-    parameters: { profile: { type: 'string', description: '配置名（如 development, production, test）' } },
-    output: { schema: { type: 'json' }, render: (_a: unknown, v: unknown) => [{ type: 'text', text: `✅ ${v}` }] },
-    async execute(args: { profile: string }) {
-      const path = resolve(args.profile.includes('.') ? args.profile : `.env.${args.profile}`);
-      if (!existsSync(path)) throw new Error(`配置文件不存在: ${path}`);
-      const targetPath = resolve(config.envFile);
-      if (config.backupEnabled && existsSync(targetPath)) backupEnv(targetPath);
-      const vars = parseEnvFile(path);
-      writeEnvFile(targetPath, vars);
-      return `已切换到 ${args.profile} (${Object.keys(vars).length} 个变量)`;
-    },
-  }), 'dsh-env-switcher: env_switch');
-
-  ctx.effect(() => ctx.tools.register({
-    name: 'env_backup',
-    description: '备份当前 .env 文件。',
-    output: { schema: { type: 'json' }, render: (_a: unknown, v: unknown) => [{ type: 'text', text: `✅ 已备份到: ${v}` }] },
-    async execute() {
-      const path = resolve(config.envFile);
-      if (!existsSync(path)) throw new Error('.env 文件不存在');
-      return backupEnv(path);
-    },
-  }), 'dsh-env-switcher: env_backup');
-
-  ctx.effect(() => ctx.tools.register({
-    name: 'env_validate',
-    description: '验证环境变量的完整性和安全性。',
-    parameters: { file: { type: 'string', description: '文件路径' } },
-    output: { schema: { type: 'json' }, render: (_a: unknown, v: unknown) => {
-      const issues = v as { key: string; issue: string }[];
-      if (issues.length === 0) return [{ type: 'text', text: '✅ 所有环境变量验证通过' }];
-      return [{ type: 'text', text: `⚠️ 发现 ${issues.length} 个问题:\n` + issues.map(i => `- \`${i.key}\`: ${i.issue}`).join('\n') }];
-    }},
-    async execute(args: { file?: string }) {
-      return validateEnvVars(parseEnvFile(resolve(args.file || config.envFile)));
-    },
-  }), 'dsh-env-switcher: env_validate');
-
-  ctx.effect(() => ctx.commands.register({
-    name: 'env',
-    description: '环境变量管理',
-    input: { hint: 'list | get <key> | set <key> <value> | switch <profile> | diff <f1> <f2> | backup | validate' },
-    async handler(invocation: any) {
-      const parts = invocation.rawInput.trim().split(/\s+/).filter(Boolean);
-      if (parts.length === 0) return { kind: 'text', text: '用法: /env list|get|set|switch|diff|backup|validate' };
-      const cmd = parts[0];
-      switch (cmd) {
-        case 'list': { const v = parseEnvFile(resolve(config.envFile)); return { kind: 'text', text: Object.keys(v).join('\n') }; }
-        case 'get': { const v = parseEnvFile(resolve(config.envFile)); return { kind: 'text', text: v[parts[1]] || '未设置' }; }
-        case 'validate': { const v = validateEnvVars(parseEnvFile(resolve(config.envFile))); return { kind: 'text', text: v.length === 0 ? '通过' : v.map(i => `${i.key}: ${i.issue}`).join('\n') }; }
-        default: return { kind: 'text', text: `未知命令: ${cmd}` };
+/**
+ * Read the value term of one assignment: optional single or double quotes
+ * (double quotes expand `\n`, `\r`, `\t`, `\\`, `\"`), and optional inline
+ * comment on unquoted values.
+ * @param raw - text right of the first `=`, already trimmed.
+ * @param options - shared parse policy.
+ * @param invalid - diagnostic sink (mutated).
+ * @param lineNumber - 1-based line the value came from.
+ * @param key - owning key, for the diagnostic text.
+ * @returns The decoded value.
+ */
+function readValue(raw: string, options: ParseOptions, invalid: string[], lineNumber: number, key: string): string {
+  const quote = raw[0]
+  if (quote === '"' || quote === "'") {
+    let index = 1
+    let out = ''
+    let closed = false
+    while (index < raw.length) {
+      const char = raw[index]!
+      if (char === '\\' && quote === '"' && index + 1 < raw.length) {
+        const next = raw[index + 1]!
+        out += next === 'n' ? '\n' : next === 'r' ? '\r' : next === 't' ? '\t' : next
+        index += 2
+        continue
       }
-    },
-  }), 'dsh-env-switcher: command');
+      if (char === quote) {
+        closed = true
+        index += 1
+        break
+      }
+      out += char
+      index += 1
+    }
+    if (!closed) {
+      invalid.push(`line ${lineNumber}: key "${key}" has an unterminated ${quote} quote; raw text was kept`)
+      return raw
+    }
+    const rest = raw.slice(index).trim()
+    if (rest !== '' && !rest.startsWith('#')) {
+      invalid.push(`line ${lineNumber}: key "${key}" has unexpected text after the closing quote; it was dropped`)
+    }
+    return out
+  }
+  if (!options.stripInlineComments) return raw
+  if (raw.startsWith('#')) return ''
+  return raw.replace(/\s+#.*$/, '').trimEnd()
+}
 
-  ctx.inject(['settings'], (sctx: any) => {
-    const { settingsNamespace } = require('@deepseek-ai/dsh-settings');
-    sctx.settings.register(settingsNamespace('env-switcher'), configSchema, { base: config, expose: true, applies: 'live' });
-  });
+/**
+ * Parse dotenv file content into an ordered key/value map.
+ * @param text - complete file content.
+ * @param options - shared parse policy.
+ * @returns Values (last duplicate wins) and per-line skip notes.
+ */
+function parseEnv(text: string, options: ParseOptions): ParsedEnv {
+  const values: Record<string, string> = {}
+  const invalid: string[] = []
+  const lines = text.split(/\r?\n/)
+  for (let index = 0; index < lines.length; index += 1) {
+    const lineNumber = index + 1
+    const line = lines[index]!.trim()
+    if (line === '' || line.startsWith('#')) continue
+    const statement = options.allowExportPrefix && /^export\s+/.test(line) ? line.replace(/^export\s+/, '') : line
+    const separator = statement.indexOf('=')
+    if (separator === -1) {
+      invalid.push(`line ${lineNumber}: no "=" separator: ${preview(statement)}`)
+      continue
+    }
+    const key = statement.slice(0, separator).trim()
+    if (!KEY_PATTERN.test(key)) {
+      invalid.push(`line ${lineNumber}: invalid key "${preview(key)}"`)
+      continue
+    }
+    if (key.length > options.maxKeyLength) {
+      invalid.push(`line ${lineNumber}: key "${key.slice(0, 24)}..." exceeds ${options.maxKeyLength} characters`)
+      continue
+    }
+    setKey(values, key, readValue(statement.slice(separator + 1).trim(), options, invalid, lineNumber, key))
+  }
+  return { values, invalid }
+}
+
+/**
+ * Compare two parsed env maps.
+ * @param a - original side.
+ * @param b - updated side.
+ * @returns Added, removed, and changed keys, all sorted by key.
+ */
+function diffEnv(a: Record<string, string>, b: Record<string, string>): {
+  added: string[]
+  removed: string[]
+  changed: { key: string; from: string; to: string }[]
+  identical: boolean
+} {
+  const added: string[] = []
+  const removed: string[] = []
+  const changed: { key: string; from: string; to: string }[] = []
+  for (const key of Object.keys(b)) {
+    if (!Object.hasOwn(a, key)) added.push(key)
+    else if (a[key] !== b[key]) changed.push({ key, from: a[key], to: b[key] })
+  }
+  for (const key of Object.keys(a)) if (!Object.hasOwn(b, key)) removed.push(key)
+  return {
+    added: added.sort(),
+    removed: removed.sort(),
+    changed: changed.sort((left, right) => (left.key < right.key ? -1 : left.key > right.key ? 1 : 0)),
+    identical: added.length === 0 && removed.length === 0 && changed.length === 0,
+  }
+}
+
+/** Whether a value parses as an http(s) URL. */
+function isUrl(value: string): boolean {
+  try {
+    const url = new URL(value)
+    return url.protocol === 'http:' || url.protocol === 'https:'
+  } catch {
+    return false
+  }
+}
+
+/**
+ * Run one named check against one value.
+ * @param check - check kind chosen by the schema.
+ * @param value - parsed value.
+ * @param pattern - regex source, used only by the `pattern` check.
+ * @returns A failure phrase, or `undefined` when the value passes.
+ */
+function describeFailure(check: CheckName, value: string, pattern: string): string | undefined {
+  switch (check) {
+    case 'nonempty':
+      return value === '' ? 'value is empty' : undefined
+    case 'integer':
+      return INTEGER_PATTERN.test(value) ? undefined : 'value is not an integer'
+    case 'number':
+      return value !== '' && Number.isFinite(Number(value)) ? undefined : 'value is not a number'
+    case 'boolean':
+      return BOOLEAN_PATTERN.test(value) ? undefined : 'value is not a boolean (true/false/1/0/yes/no/on/off)'
+    case 'port': {
+      if (!INTEGER_PATTERN.test(value)) return 'value is not a port number'
+      const port = Number(value)
+      return port >= 1 && port <= 65535 ? undefined : 'port must be between 1 and 65535'
+    }
+    case 'url':
+      return isUrl(value) ? undefined : 'value is not an http(s) URL'
+    case 'email':
+      return EMAIL_PATTERN.test(value) ? undefined : 'value is not an email address'
+    case 'csv':
+      return value !== '' && value.split(',').every((item) => item.trim() !== '')
+        ? undefined
+        : 'value is not a comma-separated list of non-empty items'
+    case 'pattern': {
+      if (pattern === '') return 'check "pattern" needs a non-empty pattern'
+      let expression: RegExp
+      try {
+        expression = new RegExp(pattern)
+      } catch (error) {
+        return `pattern is not a valid regex: ${error instanceof Error ? error.message : String(error)}`
+      }
+      return expression.test(value) ? undefined : `value does not match pattern ${pattern}`
+    }
+    default:
+      return `unknown check "${String(check)}"`
+  }
+}
+
+/** Whether a value must be quoted to survive a re-parse. */
+function needsQuotes(value: string): boolean {
+  return value === '' || !SAFE_VALUE_PATTERN.test(value)
+}
+
+/** Escape one value into a double-quoted dotenv term. */
+function quoteValue(value: string): string {
+  const escaped = value
+    .replace(/\\/g, '\\\\')
+    .replace(/"/g, '\\"')
+    .replace(/\n/g, '\\n')
+    .replace(/\r/g, '\\r')
+    .replace(/\t/g, '\\t')
+  return `"${escaped}"`
+}
+
+/**
+ * Render an object back into dotenv file content.
+ * @param values - key/value map supplied by the caller.
+ * @param sortKeys - emit keys alphabetically instead of in insertion order.
+ * @param options - shared policy (key syntax and length limits).
+ * @returns File text ending in a newline, plus counts and skip notes.
+ */
+function serializeEnv(values: Record<string, unknown>, sortKeys: boolean, options: ParseOptions): {
+  text: string
+  count: number
+  skipped: string[]
+} {
+  const keys = Object.keys(values)
+  if (sortKeys) keys.sort()
+  const lines: string[] = []
+  const skipped: string[] = []
+  for (const key of keys) {
+    if (!KEY_PATTERN.test(key)) {
+      skipped.push(`"${preview(key)}": not a valid env key`)
+      continue
+    }
+    if (key.length > options.maxKeyLength) {
+      skipped.push(`${key}: key exceeds ${options.maxKeyLength} characters`)
+      continue
+    }
+    const value = values[key]
+    if (value === null || value === undefined) {
+      lines.push(`${key}=`)
+      continue
+    }
+    if (typeof value === 'number' && !Number.isFinite(value)) {
+      skipped.push(`${key}: non-finite number`)
+      continue
+    }
+    if (typeof value !== 'string' && typeof value !== 'number' && typeof value !== 'boolean') {
+      skipped.push(`${key}: ${Array.isArray(value) ? 'array' : typeof value} values are not supported`)
+      continue
+    }
+    const text = typeof value === 'string' ? value : String(value)
+    lines.push(`${key}=${needsQuotes(text) ? quoteValue(text) : text}`)
+  }
+  return { text: lines.length === 0 ? '' : `${lines.join('\n')}\n`, count: lines.length, skipped }
+}
+
+/**
+ * Resolve the deployment configuration into a parse policy, tolerating a
+ * partial or oddly-typed config object coming from a layer file.
+ * @param config - explicit deployment config.
+ * @returns Normalised parse policy.
+ */
+function toParseOptions(config: Config): ParseOptions {
+  const length = Number(config.maxKeyLength)
+  return {
+    allowExportPrefix: config.allowExportPrefix !== false,
+    stripInlineComments: config.stripInlineComments !== false,
+    maxKeyLength: Number.isFinite(length) && length > 0 ? Math.floor(length) : 128,
+  }
+}
+
+/**
+ * Register the four env text tools on `ctx.tools`.
+ * @param ctx - registrant context carrying the tool registry.
+ * @param config - deployment's explicit env policy.
+ */
+export function apply(ctx: Context, config: Config): void {
+  const options = toParseOptions(config)
+
+  ctx.tools.register(defineTool({
+    name: 'env_parse',
+    description:
+      'Parse dotenv file CONTENT (pass the text, never a path) into key/value pairs. ' +
+      'Handles comments, blank lines, `export ` prefixes, single/double quotes with ' +
+      '\\n \\t \\\\ escapes, and inline comments. Lines that cannot be read are listed in ' +
+      '`invalid` instead of failing the call. On duplicate keys the last value wins.',
+    parameters: {
+      text: { type: 'string', required: true, description: 'The complete contents of one .env file.' },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          values: {
+            type: 'object',
+            required: true,
+            additionalProperties: true,
+            description: 'Parsed keys in first-seen order; every value is a string.',
+          },
+          count: { type: 'integer', required: true, description: 'Number of keys parsed.' },
+          invalid: {
+            type: 'array',
+            required: true,
+            description: 'One note per unreadable line; empty when the file parsed cleanly.',
+            items: { type: 'string' },
+          },
+        },
+      },
+      render: (_args, value) => {
+        const keys = Object.keys(value.values)
+        const head = `${value.count} variable(s): ${keys.length === 0 ? 'none' : keys.join(', ')}`
+        const tail = value.invalid.length === 0
+          ? ''
+          : `\nskipped ${value.invalid.length} line(s):\n- ${value.invalid.join('\n- ')}`
+        return [{ type: 'text', text: head + tail }]
+      },
+    },
+    isConcurrencySafe: () => true,
+    execute(args) {
+      const parsed = parseEnv(args.text, options)
+      return Promise.resolve({
+        values: parsed.values,
+        count: Object.keys(parsed.values).length,
+        invalid: parsed.invalid,
+      })
+    },
+  }))
+
+  ctx.tools.register(defineTool({
+    name: 'env_diff',
+    description:
+      'Compare two dotenv files given as text and report the key differences: `added` ' +
+      '(in b only), `removed` (in a only), and `changed` (present in both with a ' +
+      'different value, reported as from -> to). Pass the original content as `a` and ' +
+      'the updated content as `b`; unreadable lines are ignored on both sides.',
+    parameters: {
+      a: { type: 'string', required: true, description: 'Original / left-hand .env content.' },
+      b: { type: 'string', required: true, description: 'Updated / right-hand .env content.' },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          added: { type: 'array', required: true, description: 'Keys present only in b, sorted.', items: { type: 'string' } },
+          removed: { type: 'array', required: true, description: 'Keys present only in a, sorted.', items: { type: 'string' } },
+          changed: {
+            type: 'array',
+            required: true,
+            description: 'Keys present in both with different values, sorted by key.',
+            items: {
+              type: 'object',
+              additionalProperties: false,
+              properties: {
+                key: { type: 'string', required: true, description: 'Variable name that changed.' },
+                from: { type: 'string', required: true, description: 'Value in a.' },
+                to: { type: 'string', required: true, description: 'Value in b.' },
+              },
+            },
+          },
+          identical: { type: 'boolean', required: true, description: 'True when the two files define the same keys with the same values.' },
+        },
+      },
+      render: (_args, value) => {
+        if (value.identical) return [{ type: 'text', text: 'Identical: same keys, same values.' }]
+        const lines = [
+          value.added.length === 0 ? '' : `added (${value.added.length}): ${value.added.join(', ')}`,
+          value.removed.length === 0 ? '' : `removed (${value.removed.length}): ${value.removed.join(', ')}`,
+          value.changed.length === 0
+            ? ''
+            : `changed (${value.changed.length}): ${value.changed.map((c) => `${c.key}: ${JSON.stringify(c.from)} -> ${JSON.stringify(c.to)}`).join('; ')}`,
+        ].filter((line) => line !== '')
+        return [{ type: 'text', text: lines.join('\n') }]
+      },
+    },
+    isConcurrencySafe: () => true,
+    execute(args) {
+      return Promise.resolve(diffEnv(parseEnv(args.a, options).values, parseEnv(args.b, options).values))
+    },
+  }))
+
+  ctx.tools.register(defineTool({
+    name: 'env_validate',
+    description:
+      'Check dotenv file CONTENT (text, not a path) against a schema you pass inline: ' +
+      '`required` and `optional` list the expected key names, and `checks` gives per-key ' +
+      'value rules (nonempty, integer, number, boolean, port, url, email, csv, pattern). ' +
+      'Reported: `missing` required keys, `extra` keys not declared anywhere in the ' +
+      'schema, and `errors` for rule failures and unreadable lines. Keys named in a ' +
+      'check count as declared. Set pattern to "" for every check that is not "pattern".',
+    parameters: {
+      text: { type: 'string', required: true, description: 'The complete contents of the .env file to check.' },
+      schema: {
+        type: 'object',
+        required: true,
+        additionalProperties: false,
+        description: 'Expected keys and per-key value rules.',
+        properties: {
+          required: {
+            type: 'array',
+            required: true,
+            description: 'Keys that must be present. Pass [] when none are required.',
+            items: { type: 'string' },
+          },
+          optional: {
+            type: 'array',
+            required: true,
+            description: 'Keys that are allowed but not required. Pass [] when none are optional.',
+            items: { type: 'string' },
+          },
+          checks: {
+            type: 'array',
+            required: true,
+            description: 'Per-key value rules; skipped when the key is absent. Pass [] for no rules.',
+            items: {
+              type: 'object',
+              additionalProperties: false,
+              properties: {
+                key: { type: 'string', required: true, description: 'Variable to check.' },
+                check: {
+                  type: 'string',
+                  required: true,
+                  description: 'Rule kind: nonempty, integer, number, boolean, port, url, email, csv, or pattern.',
+                  enum: ['nonempty', 'integer', 'number', 'boolean', 'port', 'url', 'email', 'csv', 'pattern'],
+                },
+                pattern: {
+                  type: 'string',
+                  required: true,
+                  description: 'Regex source used only when check is "pattern"; pass "" otherwise.',
+                },
+              },
+            },
+          },
+        },
+      },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          valid: { type: 'boolean', required: true, description: 'True when nothing is missing, extra, or failing.' },
+          count: { type: 'integer', required: true, description: 'Number of keys parsed from the text.' },
+          missing: { type: 'array', required: true, description: 'Required keys absent from the file, sorted.', items: { type: 'string' } },
+          extra: { type: 'array', required: true, description: 'Keys not declared by the schema, sorted.', items: { type: 'string' } },
+          errors: {
+            type: 'array',
+            required: true,
+            description: 'Rule failures plus unreadable-line notes, in check order.',
+            items: { type: 'string' },
+          },
+        },
+      },
+      render: (_args, value) => {
+        if (value.valid) return [{ type: 'text', text: `Valid: ${value.count} variable(s), schema satisfied.` }]
+        const lines = [`Invalid (${value.count} variable(s) parsed):`]
+        if (value.missing.length > 0) lines.push(`- missing: ${value.missing.join(', ')}`)
+        if (value.extra.length > 0) lines.push(`- extra: ${value.extra.join(', ')}`)
+        for (const error of value.errors) lines.push(`- ${error}`)
+        return [{ type: 'text', text: lines.join('\n') }]
+      },
+    },
+    isConcurrencySafe: () => true,
+    execute(args) {
+      const parsed = parseEnv(args.text, options)
+      const declared = new Set([...args.schema.required, ...args.schema.optional, ...args.schema.checks.map((c) => c.key)])
+      const missing = args.schema.required.filter((key) => !Object.hasOwn(parsed.values, key)).sort()
+      const extra = Object.keys(parsed.values).filter((key) => !declared.has(key)).sort()
+      const errors = [...parsed.invalid]
+      for (const rule of args.schema.checks) {
+        if (!Object.hasOwn(parsed.values, rule.key)) continue
+        const failure = describeFailure(rule.check, parsed.values[rule.key], rule.pattern)
+        if (failure !== undefined) errors.push(`${rule.key}: ${failure}`)
+      }
+      return Promise.resolve({
+        valid: missing.length === 0 && extra.length === 0 && errors.length === 0,
+        count: Object.keys(parsed.values).length,
+        missing,
+        extra,
+        errors,
+      })
+    },
+  }))
+
+  ctx.tools.register(defineTool({
+    name: 'env_serialize',
+    description:
+      'Turn a key/value object back into dotenv file text (one `KEY=value` line per ' +
+      'entry, ending with a newline) so the caller can write the file itself. Values ' +
+      'are quoted only when needed; strings with spaces, `#`, quotes, `=` or newlines ' +
+      'get double quotes with escapes, `null` becomes `KEY=`, and array or object ' +
+      'values are refused and listed in `skipped`. Set sortKeys to true for an ' +
+      'alphabetical .env, false to keep the object key order.',
+    parameters: {
+      values: {
+        type: 'object',
+        required: true,
+        additionalProperties: true,
+        description: 'Map of variable name to string / number / boolean / null value.',
+      },
+      sortKeys: { type: 'boolean', required: true, description: 'Emit keys alphabetically instead of in insertion order.' },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          text: { type: 'string', required: true, description: 'Dotenv file content, ready to write; empty when nothing serialized.' },
+          count: { type: 'integer', required: true, description: 'Number of lines emitted.' },
+          skipped: {
+            type: 'array',
+            required: true,
+            description: 'One note per entry that could not be serialized; empty otherwise.',
+            items: { type: 'string' },
+          },
+        },
+      },
+      render: (_args, value) => {
+        const head = `${value.count} line(s) serialized${value.skipped.length === 0 ? '' : `, ${value.skipped.length} skipped`}`
+        const body = value.text === '' ? head : `${head}\n\n${value.text.replace(/\n$/, '')}`
+        const tail = value.skipped.length === 0 ? '' : `\nskipped:\n- ${value.skipped.join('\n- ')}`
+        return [{ type: 'text', text: body + tail }]
+      },
+    },
+    isConcurrencySafe: () => true,
+    execute(args) {
+      return Promise.resolve(serializeEnv(args.values, args.sortKeys, options))
+    },
+  }))
 }

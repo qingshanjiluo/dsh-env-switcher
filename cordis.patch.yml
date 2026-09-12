@@ -1,5 +1,10 @@
+# dsh-env-switcher bundle layer: inserts the host tool plugin into a profile's
+# layer stack. Install with:
+#   npx -y @deepseek-ai/dsh plugin --profile web add @qingshanjiluo/dsh-env-switcher
 - insert:
     - id: env-switcher
-      name: dsh-env-switcher
+      name: '@qingshanjiluo/dsh-env-switcher'
       config:
-        enabled: true
+        allowExportPrefix: true
+        stripInlineComments: true
+        maxKeyLength: 128

@@ -1,51 +1,82 @@
 # dsh-env-switcher
 
-> DeepSeek Harness 环境变量管理
+DeepSeek Harness tool plugin: four pure tools for working with `.env` file
+**content**. The model passes dotenv text in and gets structured data or ready
+file text out — the plugin never opens a file, spawns a process, reads the host
+environment, or talks to the network, so every call is deterministic and
+parallel-safe.
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-
-## ✨ 功能特性
-
-- 🔧 **环境管理**: 解析、写入、验证 .env 文件
-- 🔄 **环境切换**: 快速切换 .env.development/.env.production
-- 📊 **差异对比**: 比较两个 .env 文件的差异
-- 💾 **备份恢复**: 备份和恢复环境配置
-- ✅ **验证**: 空值、敏感字段长度、字面量检测
-
-## 📦 安装
+## Install
 
 ```bash
-npm install dsh-env-switcher
+npx -y @deepseek-ai/dsh plugin --profile web add @qingshanjiluo/dsh-env-switcher
 ```
 
-## 🛠️ 工具
+The bundle layer (`cordis.patch.yml`) inserts the plugin into the profile's
+layer stack; the tools appear in the model's tool list on the next session.
 
-| 工具名 | 描述 | 参数 |
-|--------|------|------|
-| `env_list` | 列出环境变量 | `file` |
-| `env_get` | 获取变量值 | `key`, `file` |
-| `env_set` | 设置变量 | `key`, `value`, `file` |
-| `env_diff` | 对比两个 .env | `file1`, `file2` |
-| `env_switch` | 切换环境配置 | `profile` |
-| `env_backup` | 备份 .env | 无 |
-| `env_validate` | 验证变量 | `file` |
+## Tools
 
-## 📋 命令
+| Tool | Input | Output |
+| --- | --- | --- |
+| `env_parse` | `text` — complete `.env` content | `values` (ordered key → string map), `count`, `invalid` (one note per unreadable line) |
+| `env_diff` | `a` — original content, `b` — updated content | `added`, `removed`, `changed` (`{ key, from, to }`), `identical` |
+| `env_validate` | `text` — `.env` content, `schema` (`required[]`, `optional[]`, `checks[{ key, check, pattern }]`) | `valid`, `count`, `missing`, `extra`, `errors` |
+| `env_serialize` | `values` — key → scalar map, `sortKeys` — emit alphabetically | `text` (file-ready content ending in a newline), `count`, `skipped` |
 
-- `/env list` — 列出变量
-- `/env get <key>` — 获取值
-- `/env set <key> <value>` — 设置值
-- `/env switch <profile>` — 切换环境
-- `/env validate` — 验证
+### Parsing rules
 
-## ⚙️ 配置
+- Blank lines and `#` comment lines are ignored; `export KEY=value` is accepted.
+- Single-quoted values are literal. Double-quoted values expand `\n`, `\r`,
+  `\t`, `\"`, `\\`. An unterminated quote or trailing junk after the closing
+  quote is reported in `invalid` and never throws.
+- Unquoted values drop a ` # comment` when it is preceded by whitespace
+  (configurable); `KEY=#thing` becomes an empty value.
+- Duplicate keys: the last value wins, the first position is kept.
+- Keys must match `[A-Za-z_][A-Za-z0-9_]*` and stay within `maxKeyLength`;
+  anything else is reported in `invalid` / `errors` / `skipped`.
 
-| 配置项 | 类型 | 默认值 | 说明 |
-|--------|------|--------|------|
-| `enabled` | boolean | `true` | 启用插件 |
-| `envFile` | string | `.env` | 配置文件路径 |
-| `backupEnabled` | boolean | `true` | 启用备份 |
+### Validation checks
 
-## 📄 License
+`check` accepts `nonempty`, `integer`, `number`, `boolean`
+(`true/false/1/0/yes/no/on/off`, case-insensitive), `port` (1–65535), `url`
+(http/https), `email`, `csv` (comma-separated, no empty items), and `pattern`
+(a regex source in the same check entry — an invalid regex is reported as an
+error instead of throwing). A check for a key that is absent is skipped; keys
+named in a check count as declared, so they are not reported as `extra`.
+
+## Configuration
+
+| Field | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `allowExportPrefix` | boolean | `true` | Accept `export KEY=value` lines when parsing |
+| `stripInlineComments` | boolean | `true` | Drop trailing ` # comment` from unquoted values |
+| `maxKeyLength` | number | `128` | Report keys longer than this instead of storing them |
+
+## Example
+
+```text
+env_validate({
+  text: "PORT=8080\nEXTRA=1",
+  schema: {
+    required: ["PORT", "HOST"],
+    optional: [],
+    checks: [{ key: "PORT", check: "port", pattern: "" }],
+  },
+})
+# -> missing: HOST · extra: EXTRA · valid: false
+```
+
+## Development
+
+```bash
+npm install --no-audit --no-fund
+npx tsc --noEmit
+npm run build          # lib/index.js + lib/index.d.ts
+npx vitest run         # 23 behaviour cases
+node scripts/load-smoke.mjs
+```
+
+## License
 
 MIT
